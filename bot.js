@@ -469,9 +469,8 @@ async function showOrderCategory(chatId, uid, categoryId, page = 0) {
 }
 
 async function manageServices(chatId) {
-  const ids = db.serviceIds;
-  const text = `📋 Selected Service IDs: ${ids.length}\n\n` + ids.map((id, i) => `${i + 1}. ID: ${id} | Price/1K: ${db.prices[id] ?? "Provider rate"}`).join("\n");
-  return bot.sendMessage(chatId, text);
+  // Old Selected Service IDs list removed. Use category based service view only.
+  return sendCustomerServices(chatId);
 }
 
 async function showPaymentNumbers(chatId, viewerId) {
