@@ -315,7 +315,7 @@ function rememberUser(msg) {
 }
 function normalizeButton(text) {
   const raw = String(text || '').normalize('NFKC').replace(/[\uFE0E\uFE0F]/g, '').trim();
-  const clean = raw.replace(/[^\p{L}\p{N}]+/gu, ' ').trim().toLowerCase();
+  const clean = raw.replace(/[^\p{L}\p{M}\p{N}]+/gu, ' ').trim().toLowerCase();
   const aliases = {
     'services': 'services',
     'সার্ভিস': 'services',
