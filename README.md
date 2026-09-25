@@ -19,6 +19,16 @@ The bot loads the saved database before accepting Telegram updates and preserves
 ## Order behavior
 Orders are submitted server-side to the configured SMM API using `SMM_API_KEY`. The customer is not redirected to the provider website.
 
+## Customer language and support
+- On first use, each customer chooses বাংলা or English. They can switch later from the `🌐 Language / ভাষা` button; the choice is saved with their profile.
+- The Customer Panel has a `🆘 Support` button. The owner can manage agents from Admin Panel → `🆘 Support Agents`.
+- Add an agent as `@telegram_username | Display Name`; customers can tap an agent button to open Telegram chat.
+
+## Customer service categories
+- Customer Panel → `📋 Services` and `🛒 New Order` first show platform categories such as Facebook, TikTok, Instagram, YouTube, Telegram, and other supported platforms.
+- Services are grouped from the provider's category/name. Unrecognized platforms appear under `Other Services`.
+- Choosing a category opens only the services assigned to that platform; `New Order` then lets the customer choose a service from that category.
+
 Do not put BOT_TOKEN or SMM_API_KEY in source code. Keep them in Render Environment Variables.
 
 ## Customer account & admin customer history
@@ -30,6 +40,7 @@ Do not put BOT_TOKEN or SMM_API_KEY in source code. Keep them in Render Environm
 ## Admin and manager access
 - Set `ADMIN_ID` to the owner's numeric Telegram User ID. The owner opens the panel with `/admin` and sees `👥 Manage Managers`.
 - Use `➕ Add Manager`, enter a manager's numeric Telegram User ID, and ask them to open `/admin`. They can get their ID with `/myid`.
-- Managers can only set the bKash, Nagad, and Binance payment numbers and approve or reject payment requests. They cannot access service/pricing controls, customer history, or manager controls.
-- Managers are stored in PostgreSQL with the bot settings, so the access list survives redeploys. Removing a manager takes effect immediately.
-- Managers receive payment request notifications. Order details and order notifications remain visible to the owner only.
+- Each manager has separate bKash, Nagad, and Binance numbers; the owner has a separate set. Customers see which account belongs to the owner or a manager when adding balance.
+- A payment request goes only to the owner of the selected account. Only that owner/manager can approve or reject it; manager requests cannot be approved by another manager or by the owner.
+- Managers cannot access service/pricing controls, customer history, or manager controls. The owner can view approved and pending payment totals for each manager under `💰 Manager Payment Summary`.
+- Manager accounts, their payment numbers, and payment records are stored in PostgreSQL. Removing a manager stops access; historical collection totals remain in the report.

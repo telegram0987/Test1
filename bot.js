@@ -23,17 +23,39 @@ const webhookSecret = crypto.createHash("sha256").update(BOT_TOKEN).digest("hex"
 const webhookPath = `/telegram/webhook/${webhookSecret}`;
 
 const DEFAULT_SERVICE_IDS = ["979", "133", "174", "3758", "1753", "622", "893", "2194", "1850", "1722", "9445"];
+const PAYMENT_METHODS = { bk: "বিকাশ", ng: "নগদ", bn: "বাইন্সাস" };
+const PAYMENT_METHOD_CODES = Object.fromEntries(Object.entries(PAYMENT_METHODS).map(([code, label]) => [label, code]));
+const SERVICE_CATEGORIES = [
+  { id: "facebook", label: "📘 Facebook", pattern: /facebook|\bfb\b/i },
+  { id: "instagram", label: "📸 Instagram", pattern: /instagram|\binsta\b/i },
+  { id: "tiktok", label: "🎵 TikTok", pattern: /tiktok|tik\s*tok/i },
+  { id: "youtube", label: "▶️ YouTube", pattern: /youtube|\byt\b/i },
+  { id: "telegram", label: "✈️ Telegram", pattern: /telegram|\btg\b/i },
+  { id: "twitter", label: "𝕏 X / Twitter", pattern: /twitter|x\.com|\bx\b/i },
+  { id: "whatsapp", label: "🟢 WhatsApp", pattern: /whatsapp|\bwa\b/i },
+  { id: "snapchat", label: "👻 Snapchat", pattern: /snapchat/i },
+  { id: "linkedin", label: "💼 LinkedIn", pattern: /linkedin/i },
+  { id: "pinterest", label: "📌 Pinterest", pattern: /pinterest/i },
+  { id: "reddit", label: "🔴 Reddit", pattern: /reddit/i },
+  { id: "threads", label: "🧵 Threads", pattern: /threads/i },
+  { id: "twitch", label: "🟣 Twitch", pattern: /twitch/i },
+  { id: "spotify", label: "🎧 Spotify", pattern: /spotify/i },
+  { id: "website", label: "🌐 Website / SEO", pattern: /website|web\s*traffic|seo|google/i },
+  { id: "other", label: "📦 Other Services", pattern: null }
+];
 
 const defaultDb = () => ({
   serviceIds: [...DEFAULT_SERVICE_IDS],
   prices: {},
   paymentNumbers: [],
   paymentMethods: { "বিকাশ": "", "নগদ": "", "বাইন্সাস": "" },
+  managerPaymentMethods: {},
   users: {},
   orders: {},
   balances: {},
   deposits: {},
   managers: [],
+  supportAgents: [],
   referral: { minOrder: 50, commissionRate: 0.10 }
 });
 
@@ -64,6 +86,11 @@ function normalizeDb() {
   if (!Array.isArray(db.paymentNumbers)) db.paymentNumbers = [];
   if (!db.paymentMethods || typeof db.paymentMethods !== "object") db.paymentMethods = { "বিকাশ": "", "নগদ": "", "বাইন্সাস": "" };
   for (const method of ["বিকাশ", "নগদ", "বাইন্সাস"]) if (typeof db.paymentMethods[method] !== "string") db.paymentMethods[method] = "";
+  if (!db.managerPaymentMethods || typeof db.managerPaymentMethods !== "object" || Array.isArray(db.managerPaymentMethods)) db.managerPaymentMethods = {};
+  for (const [managerId, methods] of Object.entries(db.managerPaymentMethods)) {
+    const clean = (methods && typeof methods === "object") ? methods : {};
+    db.managerPaymentMethods[String(managerId)] = Object.fromEntries(["বিকাশ", "নগদ", "বাইন্সাস"].map(method => [method, typeof clean[method] === "string" ? clean[method] : ""]));
+  }
   // Migrate old single/list payment numbers into bKash if needed.
   if (!db.paymentMethods["বিকাশ"] && db.paymentNumbers.length) db.paymentMethods["বিকাশ"] = db.paymentNumbers[0];
   db.paymentNumbers = Object.values(db.paymentMethods).filter(Boolean);
@@ -73,6 +100,9 @@ function normalizeDb() {
   if (!db.deposits || typeof db.deposits !== "object") db.deposits = {};
   if (!Array.isArray(db.managers)) db.managers = [];
   db.managers = [...new Set(db.managers.map(id => String(id).trim()).filter(id => /^\d{5,15}$/.test(id) && id !== ADMIN_ID))];
+  if (!Array.isArray(db.supportAgents)) db.supportAgents = [];
+  db.supportAgents = db.supportAgents.filter(agent => agent && typeof agent === "object" && /^[A-Za-z0-9_]{5,32}$/.test(String(agent.username || "")))
+    .map(agent => ({ username: String(agent.username).replace(/^@/, ""), name: String(agent.name || agent.username).slice(0, 50) }));
   if (!db.referral || typeof db.referral !== "object") db.referral = { minOrder: 50, commissionRate: 0.10 };
   if (!Number.isFinite(Number(db.referral.minOrder))) db.referral.minOrder = 50;
   if (!Number.isFinite(Number(db.referral.commissionRate))) db.referral.commissionRate = 0.10;
@@ -109,17 +139,21 @@ function saveDb() {
 function isOwner(id) { return Boolean(ADMIN_ID) && String(id) === ADMIN_ID; }
 function isManager(id) { return db.managers.includes(String(id)); }
 function isAdmin(id) { return isOwner(id) || isManager(id); }
-function staffIds() { return [...new Set([ADMIN_ID, ...(db.managers || [])].filter(Boolean))]; }
+function languageOf(id) { return db.users[String(id)]?.language === "en" ? "en" : "bn"; }
+function localized(id, bangla, english) { return languageOf(id) === "en" ? english : bangla; }
+function languagePickerMarkup() {
+  return { inline_keyboard: [[
+    { text: "বাংলা", callback_data: "language:bn" },
+    { text: "English", callback_data: "language:en" }
+  ]] };
+}
+async function showLanguagePicker(chatId, uid) {
+  return bot.sendMessage(chatId, localized(uid, "🌐 আপনার পছন্দের ভাষা নির্বাচন করুন:", "🌐 Choose your preferred language:"), { reply_markup: languagePickerMarkup() });
+}
 async function notifyOwner(message, options) {
   if (!ADMIN_ID) return;
   try { await bot.sendMessage(ADMIN_ID, message, options); }
   catch (e) { console.error(`Owner notification failed:`, e.response?.body || e.message); }
-}
-async function notifyStaff(message, options) {
-  for (const id of staffIds()) {
-    try { await bot.sendMessage(id, message, options); }
-    catch (e) { console.error(`Staff notification failed for ${id}:`, e.response?.body || e.message); }
-  }
 }
 function money(n) { return Number(n || 0).toFixed(2); }
 function getBalance(uid) { return Number(db.balances[String(uid)] || 0); }
@@ -201,13 +235,13 @@ async function syncOrderStatuses() {
             order.referralCommission = referralCommission;
             order.referralPaidTo = referrerId;
             try {
-              await bot.sendMessage(referrerId, `🎁 Referral Reward Added!\n\n🆔 Order: ${order.id}\n💵 Customer Order: ৳${money(order.cost)}\n💰 Referral Reward: ৳5.00\n💵 Your Balance: ৳${money(getBalance(referrerId))}`, { reply_markup: customerKeyboard(Number(referrerId)) });
+              await bot.sendMessage(referrerId, localized(referrerId, `🎁 রেফারেল পুরস্কার যোগ হয়েছে!\n\n🆔 অর্ডার: ${order.id}\n💵 কাস্টমারের অর্ডার: ৳${money(order.cost)}\n💰 পুরস্কার: ৳5.00\n💵 আপনার ব্যালেন্স: ৳${money(getBalance(referrerId))}`, `🎁 Referral reward added!\n\n🆔 Order: ${order.id}\n💵 Customer order: ৳${money(order.cost)}\n💰 Reward: ৳5.00\n💵 Your balance: ৳${money(getBalance(referrerId))}`), { reply_markup: customerKeyboard(Number(referrerId)) });
             } catch (notifyErr) {
               console.error(`Referral notification failed for ${referrerId}:`, notifyErr.response?.body || notifyErr.message);
             }
           }
 
-          const customerText = `🎉 Order Completed!\n\n🆔 Order: ${order.id}\n📌 Service: ${order.serviceId}\n🔢 Quantity: ${order.quantity}\n💵 Cost: ৳${money(order.cost)}\n📊 Status: ✅ Completed${order.providerOrderId ? `\n🔢 Provider Order: ${order.providerOrderId}` : ''}`;
+          const customerText = localized(order.userId, `🎉 অর্ডার সম্পন্ন হয়েছে!\n\n🆔 অর্ডার: ${order.id}\n📌 সার্ভিস: ${order.serviceName || order.serviceId}\n🔢 পরিমাণ: ${order.quantity}\n💵 খরচ: ৳${money(order.cost)}\n📊 অবস্থা: ✅ সম্পন্ন${order.providerOrderId ? `\n🔢 Provider Order: ${order.providerOrderId}` : ''}`, `🎉 Order completed!\n\n🆔 Order: ${order.id}\n📌 Service: ${order.serviceName || order.serviceId}\n🔢 Quantity: ${order.quantity}\n💵 Cost: ৳${money(order.cost)}\n📊 Status: ✅ Completed${order.providerOrderId ? `\n🔢 Provider Order: ${order.providerOrderId}` : ''}`);
           try {
             await bot.sendMessage(String(order.userId), customerText, { reply_markup: customerKeyboard(order.userId) });
           } catch (notifyErr) {
@@ -227,11 +261,13 @@ async function syncOrderStatuses() {
 }
 
 function customerKeyboard(userId) {
+  const en = languageOf(userId) === "en";
   const rows = [
-    [{ text: "📋 Services" }, { text: "💰 Balance" }],
-    [{ text: "💳 Add Balance" }, { text: "🛒 New Order" }],
-    [{ text: "📦 My Orders" }, { text: "👥 Referral" }],
-    [{ text: "👤 Account Details" }]
+    [{ text: en ? "📋 Services" : "📋 সার্ভিস" }, { text: en ? "💰 Balance" : "💰 ব্যালেন্স" }],
+    [{ text: en ? "💳 Add Balance" : "💳 ব্যালেন্স যোগ" }, { text: en ? "🛒 New Order" : "🛒 নতুন অর্ডার" }],
+    [{ text: en ? "📦 My Orders" : "📦 আমার অর্ডার" }, { text: en ? "👥 Referral" : "👥 রেফারেল" }],
+    [{ text: en ? "👤 Account Details" : "👤 অ্যাকাউন্ট তথ্য" }],
+    [{ text: en ? "🆘 Support" : "🆘 সাপোর্ট" }, { text: "🌐 Language / ভাষা" }]
   ];
   if (isAdmin(userId)) rows.push([{ text: "⚙️ Admin Panel" }]);
   return { keyboard: rows, resize_keyboard: true, is_persistent: true };
@@ -252,8 +288,11 @@ function adminKeyboard(viewerId) {
     [{ text: "👤 Customer Details" }],
     [{ text: "🔙 Customer Menu" }]
   ];
-  // Private chat IDs match the Telegram user's ID, so only the owner sees staff controls.
-  if (isOwner(viewerId)) rows.splice(rows.length - 1, 0, [{ text: "👥 Manage Managers" }]);
+  if (isOwner(viewerId)) {
+    rows.splice(rows.length - 1, 0, [{ text: "💰 Manager Payment Summary" }]);
+    rows.splice(rows.length - 1, 0, [{ text: "👥 Manage Managers" }]);
+    rows.splice(rows.length - 1, 0, [{ text: "🆘 Support Agents" }]);
+  }
   return { keyboard: rows, resize_keyboard: true, is_persistent: true };
 }
 
@@ -279,13 +318,21 @@ function normalizeButton(text) {
   const clean = raw.replace(/[^\p{L}\p{N}]+/gu, ' ').trim().toLowerCase();
   const aliases = {
     'services': 'services',
+    'সার্ভিস': 'services',
     'balance': 'balance',
+    'ব্যালেন্স': 'balance',
     'add balance': 'add balance',
+    'ব্যালেন্স যোগ': 'add balance',
     'new order': 'new order',
+    'নতুন অর্ডার': 'new order',
     'my orders': 'my orders',
+    'আমার অর্ডার': 'my orders',
     'referral': 'referral',
+    'রেফারেল': 'referral',
     'admin panel': 'admin panel',
     'manage managers': 'manage managers',
+    'manager payment summary': 'manager payment summary',
+    'support agents': 'support agents',
     'manage services': 'manage services',
     'add service id': 'add service id',
     'remove service id': 'remove service id',
@@ -296,9 +343,14 @@ function normalizeButton(text) {
     'payment methods': 'payment numbers',
     'change payment number': 'change payment number',
     'payment requests': 'payment requests',
+    'support': 'support',
+    'সাপোর্ট': 'support',
+    'language ভাষা': 'language',
+    'ভাষা language': 'language',
     'user count': 'user count',
     'customer details': 'customer details',
     'account details': 'account details',
+    'অ্যাকাউন্ট তথ্য': 'account details',
     'customer menu': 'customer menu'
   };
   return aliases[clean] || clean;
@@ -312,24 +364,107 @@ function selectedServiceInfo(all, serviceId) {
   return { ...s, id: String(serviceId), providerRate, price };
 }
 
+function categoryIdForService(service) {
+  const details = `${service.category || ""} ${service.type || ""} ${service.name || ""}`;
+  return SERVICE_CATEGORIES.find(c => c.pattern && c.pattern.test(details))?.id || "other";
+}
+
+function groupSelectedServices(all) {
+  const selected = all.filter(s => db.serviceIds.includes(String(s.service ?? s.id ?? "")));
+  const groups = new Map(SERVICE_CATEGORIES.map(category => [category.id, { ...category, services: [] }]));
+  for (const service of selected) groups.get(categoryIdForService(service)).services.push(service);
+  return [...groups.values()].filter(group => group.services.length);
+}
+
+async function loadSelectedServiceGroups() {
+  return groupSelectedServices(await getServices());
+}
+
+function categoryLabel(group, uid) {
+  const labels = {
+    facebook: ["📘 ফেসবুক", "📘 Facebook"], instagram: ["📸 ইন্সটাগ্রাম", "📸 Instagram"],
+    tiktok: ["🎵 টিকটক", "🎵 TikTok"], youtube: ["▶️ ইউটিউব", "▶️ YouTube"],
+    telegram: ["✈️ টেলিগ্রাম", "✈️ Telegram"], twitter: ["𝕏 এক্স / টুইটার", "𝕏 X / Twitter"],
+    whatsapp: ["🟢 হোয়াটসঅ্যাপ", "🟢 WhatsApp"], snapchat: ["👻 স্ন্যাপচ্যাট", "👻 Snapchat"],
+    linkedin: ["💼 লিংকডইন", "💼 LinkedIn"], pinterest: ["📌 পিন্টারেস্ট", "📌 Pinterest"],
+    reddit: ["🔴 রেডিট", "🔴 Reddit"], threads: ["🧵 থ্রেডস", "🧵 Threads"],
+    twitch: ["🟣 টুইচ", "🟣 Twitch"], spotify: ["🎧 স্পটিফাই", "🎧 Spotify"],
+    website: ["🌐 ওয়েবসাইট / SEO", "🌐 Website / SEO"], other: ["📦 অন্যান্য সার্ভিস", "📦 Other Services"]
+  };
+  const pair = labels[group.id] || [group.label, group.label];
+  return localized(uid, pair[0], pair[1]);
+}
+
+function categoryKeyboard(groups, callbackPrefix, uid) {
+  const rows = groups.map(group => [{
+    text: `${categoryLabel(group, uid)} (${group.services.length})`,
+    callback_data: `${callbackPrefix}:${group.id}`
+  }]);
+  return { inline_keyboard: rows };
+}
+
 async function sendCustomerServices(chatId) {
   try {
-    const all = await getServices();
-    const selected = all.filter(s => db.serviceIds.includes(String(s.service ?? s.id ?? "")));
-    if (!selected.length) return bot.sendMessage(chatId, "⚠️ আপনার নির্বাচিত কোনো service provider API-তে পাওয়া যায়নি।\n\nAdmin Panel → Manage Services থেকে ID পরীক্ষা করুন।");
-    let text = "📋 Trusted BAZAAR Services\n\n";
-    for (const s of selected) {
-      const serviceId = String(s.service ?? s.id);
-      const customPrice = db.prices[serviceId];
-      const priceText = customPrice !== undefined ? `💰 Price/1K: ${money(customPrice)}` : `💰 Provider rate/1K: ${s.rate ?? "-"}`;
-      const line = `🆔 ${serviceId}\n📌 ${s.name ?? "-"}\n${priceText}\n🔢 Min: ${s.min ?? "-"} | Max: ${s.max ?? "-"}\n\n`;
-      if ((text + line).length > 3500) { await bot.sendMessage(chatId, text); text = "📋 Services (continued)\n\n"; }
-      text += line;
-    }
-    return bot.sendMessage(chatId, text);
+    const groups = await loadSelectedServiceGroups();
+    if (!groups.length) return bot.sendMessage(chatId, localized(chatId, "⚠️ আপনার নির্বাচিত কোনো সার্ভিস provider API-তে পাওয়া যায়নি।\n\nAdmin Panel → Manage Services থেকে ID পরীক্ষা করুন।", "⚠️ None of your selected services were found in the provider API.\n\nCheck the IDs in Admin Panel → Manage Services."));
+    return bot.sendMessage(chatId, localized(chatId, "📋 Trusted BAZAAR Services\n\nএকটি ক্যাটাগরি নির্বাচন করুন:", "📋 Trusted BAZAAR Services\n\nChoose a category:"), { reply_markup: categoryKeyboard(groups, "browse_cat", chatId) });
   } catch (e) {
     console.error("Services error:", e.response?.data || e.message);
-    return bot.sendMessage(chatId, "❌ Services আনা যায়নি। SMM_API_KEY/API URL এবং Render Logs পরীক্ষা করুন।");
+    return bot.sendMessage(chatId, localized(chatId, "❌ সার্ভিস আনা যায়নি। SMM_API_KEY/API URL এবং Render Logs পরীক্ষা করুন।", "❌ Could not load services. Check SMM_API_KEY/API URL and Render logs."));
+  }
+}
+
+async function showCategoryServices(chatId, categoryId) {
+  try {
+    const groups = await loadSelectedServiceGroups();
+    const group = groups.find(item => item.id === categoryId);
+    if (!group) return bot.sendMessage(chatId, localized(chatId, "⚠️ এই ক্যাটাগরিতে কোনো সার্ভিস পাওয়া যায়নি।", "⚠️ No services found in this category."));
+    const label = categoryLabel(group, chatId);
+    let text = `${label} ${localized(chatId, "সার্ভিস", "Services")} (${group.services.length})\n\n`;
+    const chunks = [];
+    for (const service of group.services) {
+      const serviceId = String(service.service ?? service.id);
+      const price = db.prices[serviceId] !== undefined ? Number(db.prices[serviceId]) : Number(service.rate || 0);
+      const line = localized(chatId, `🆔 ${serviceId}\n📌 ${service.name || "সার্ভিস"}\n💰 প্রতি ১K: ৳${money(price)}\n🔢 সর্বনিম্ন: ${service.min ?? "-"} | সর্বোচ্চ: ${service.max ?? "-"}\n\n`, `🆔 ${serviceId}\n📌 ${service.name || "Service"}\n💰 Price/1K: ৳${money(price)}\n🔢 Min: ${service.min ?? "-"} | Max: ${service.max ?? "-"}\n\n`);
+      if ((text + line).length > 3500) { chunks.push(text); text = `${label} ${localized(chatId, "সার্ভিস", "Services")} (continued)\n\n`; }
+      text += line;
+    }
+    if (text) chunks.push(text);
+    for (let i = 0; i < chunks.length; i++) {
+      const options = i === chunks.length - 1 ? { reply_markup: { inline_keyboard: [[{ text: localized(chatId, "🔙 ক্যাটাগরি", "🔙 Categories"), callback_data: "browse_categories" }]] } } : undefined;
+      await bot.sendMessage(chatId, chunks[i], options);
+    }
+  } catch (e) {
+    console.error("Category services error:", e.response?.data || e.message);
+    return bot.sendMessage(chatId, localized(chatId, "❌ এই ক্যাটাগরির সার্ভিস আনা যায়নি।", "❌ Could not load services in this category."));
+  }
+}
+
+async function showOrderCategory(chatId, uid, categoryId, page = 0) {
+  try {
+    const groups = await loadSelectedServiceGroups();
+    const group = groups.find(item => item.id === categoryId);
+    if (!group) return bot.sendMessage(chatId, localized(chatId, "⚠️ এই ক্যাটাগরিতে কোনো সার্ভিস পাওয়া যায়নি।", "⚠️ No services found in this category."));
+    const pageSize = 85;
+    const pageCount = Math.ceil(group.services.length / pageSize);
+    const pageIndex = Math.min(Math.max(0, Number(page) || 0), Math.max(0, pageCount - 1));
+    const pageServices = group.services.slice(pageIndex * pageSize, (pageIndex + 1) * pageSize);
+    const buttons = pageServices.map(service => {
+      const sid = String(service.service ?? service.id);
+      const price = db.prices[sid] !== undefined ? Number(db.prices[sid]) : Number(service.rate || 0);
+      return [{ text: `${sid} • ${String(service.name || "Service").slice(0, 32)} • ৳${money(price)}/1K`, callback_data: `order_service:${sid}` }];
+    });
+    if (pageCount > 1) {
+      const nav = [];
+      if (pageIndex > 0) nav.push({ text: localized(uid, "⬅️ আগের পৃষ্ঠা", "⬅️ Previous"), callback_data: `order_cat:${categoryId}:${pageIndex - 1}` });
+      if (pageIndex < pageCount - 1) nav.push({ text: localized(uid, "পরের পৃষ্ঠা ➡️", "Next ➡️"), callback_data: `order_cat:${categoryId}:${pageIndex + 1}` });
+      buttons.push(nav);
+    }
+    buttons.push([{ text: localized(uid, "🔙 ক্যাটাগরি", "🔙 Categories"), callback_data: "order_categories" }]);
+    return bot.sendMessage(chatId, localized(uid, `🛒 ${categoryLabel(group, uid)}\n\nএকটি সার্ভিস নির্বাচন করুন:${pageCount > 1 ? `\nপৃষ্ঠা ${pageIndex + 1}/${pageCount}` : ""}`, `🛒 ${categoryLabel(group, uid)}\n\nChoose a service:${pageCount > 1 ? `\nPage ${pageIndex + 1}/${pageCount}` : ""}`), { reply_markup: { inline_keyboard: buttons } });
+  } catch (e) {
+    console.error("Order category error:", e.response?.data || e.message);
+    return bot.sendMessage(chatId, localized(chatId, "❌ এই ক্যাটাগরির সার্ভিস আনা যায়নি।", "❌ Could not load services in this category."));
   }
 }
 
@@ -339,24 +474,44 @@ async function manageServices(chatId) {
   return bot.sendMessage(chatId, text);
 }
 
-async function showPaymentNumbers(chatId) {
-  const pm = db.paymentMethods || {};
-  const text = `💳 Payment Methods\n\n🟣 বিকাশ: ${pm["বিকাশ"] || "Not set"}\n🟢 নগদ: ${pm["নগদ"] || "Not set"}\n🔵 বাইন্সাস: ${pm["বাইন্সাস"] || "Not set"}`;
+async function showPaymentNumbers(chatId, viewerId) {
+  const ownerType = isOwner(viewerId) ? "admin" : "manager";
+  const pm = ownerType === "admin" ? db.paymentMethods : (db.managerPaymentMethods[String(viewerId)] || {});
+  const label = ownerType === "admin" ? "Admin" : "আপনার Manager";
+  const text = `💳 ${label} Payment Methods\n\n🟣 বিকাশ: ${pm["বিকাশ"] || "Not set"}\n🟢 নগদ: ${pm["নগদ"] || "Not set"}\n🔵 বাইন্যান্স: ${pm["বাইন্সাস"] || "Not set"}`;
   return bot.sendMessage(chatId, text, { reply_markup: { inline_keyboard: [
-    [{ text: "🟣 Set বিকাশ", callback_data: "admin_pay_method:বিকাশ" }],
-    [{ text: "🟢 Set নগদ", callback_data: "admin_pay_method:নগদ" }],
-    [{ text: "🔵 Set বাইন্সাস", callback_data: "admin_pay_method:বাইন্সাস" }],
+    [{ text: "🟣 Set বিকাশ", callback_data: `admin_pay_method:${ownerType === "admin" ? "a" : "m"}:bk` }],
+    [{ text: "🟢 Set নগদ", callback_data: `admin_pay_method:${ownerType === "admin" ? "a" : "m"}:ng` }],
+    [{ text: "🔵 Set বাইন্যান্স", callback_data: `admin_pay_method:${ownerType === "admin" ? "a" : "m"}:bn` }],
     [{ text: "🔙 Admin Panel", callback_data: "admin_panel" }]
   ] } });
 }
 
-async function showPaymentRequests(chatId) {
-  const pending = Object.values(db.deposits).filter(d => d.status === "pending").sort((a,b) => new Date(a.createdAt) - new Date(b.createdAt));
+async function showPaymentRequests(chatId, viewerId) {
+  const pending = Object.values(db.deposits).filter(d => {
+    if (d.status !== "pending") return false;
+    const type = d.paymentOwner || "admin";
+    return isOwner(viewerId) ? type === "admin" : type === "manager" && String(d.paymentManagerId) === String(viewerId);
+  }).sort((a,b) => new Date(a.createdAt) - new Date(b.createdAt));
   if (!pending.length) return bot.sendMessage(chatId, "💳 Payment Requests\n\nকোনো pending payment নেই।", { reply_markup: adminKeyboard(chatId) });
   for (const d of pending.slice(0, 20)) {
     const text = `💳 Pending Payment\n\n🆔 ${d.id}\n👤 User: ${d.userId}\n💵 Amount: ${money(d.amount)}\n📱 Method/Number: ${d.paymentNumber}\n🔖 TxID: ${d.txId}\n🕒 ${d.createdAt}`;
     await bot.sendMessage(chatId, text, { reply_markup: { inline_keyboard: [[{ text: "✅ Approve", callback_data: `dep_approve:${d.id}` }, { text: "❌ Reject", callback_data: `dep_reject:${d.id}` }]] } });
   }
+}
+
+async function showManagerPaymentSummary(chatId) {
+  if (!isOwner(chatId)) return bot.sendMessage(chatId, "⛔ শুধু Admin এই হিসাব দেখতে পারবেন।");
+  const managerIds = new Set([...(db.managers || []), ...Object.keys(db.managerPaymentMethods || {}), ...Object.values(db.deposits || {}).filter(d => d.paymentOwner === "manager" && d.paymentManagerId).map(d => String(d.paymentManagerId))]);
+  if (!managerIds.size) return bot.sendMessage(chatId, "💰 Manager payment হিসাব\n\nকোনো manager বা payment record নেই।", { reply_markup: adminKeyboard(chatId) });
+  const lines = [...managerIds].sort().map(id => {
+    const records = Object.values(db.deposits || {}).filter(d => d.paymentOwner === "manager" && String(d.paymentManagerId) === id);
+    const approved = records.filter(d => d.status === "approved");
+    const pending = records.filter(d => d.status === "pending");
+    const total = approved.reduce((sum, d) => sum + Number(d.amount || 0), 0);
+    return `👤 Manager ID: ${id}\n✅ Approved: ${approved.length}টি | মোট ৳${money(total)}\n⏳ Pending: ${pending.length}টি | ৳${money(pending.reduce((sum, d) => sum + Number(d.amount || 0), 0))}`;
+  });
+  return bot.sendMessage(chatId, `💰 Manager Payment হিসাব\n\n${lines.join("\n\n")}`, { reply_markup: adminKeyboard(chatId) });
 }
 
 function formatUserLabel(user) {
@@ -372,6 +527,23 @@ async function showManagers(chatId) {
   return bot.sendMessage(chatId, `👥 Manager System\n\nমোট Manager: ${ids.length}\n${ids.length ? ids.map((id, i) => `${i + 1}. ${id}`).join("\n") : "এখনো কোনো manager যোগ করা হয়নি।"}\n\nManager-রা Admin Panel ব্যবহার করতে পারবেন। শুধু Owner manager যোগ/বাদ দিতে পারবেন।`, { reply_markup: { inline_keyboard: rows } });
 }
 
+async function showSupportAgentsAdmin(chatId) {
+  const agents = db.supportAgents || [];
+  const rows = agents.map(agent => [{ text: `❌ Remove @${agent.username}`, callback_data: `support_agent_remove:${agent.username}` }]);
+  rows.push([{ text: "➕ Add Support Agent", callback_data: "support_agent_add" }]);
+  rows.push([{ text: "🔙 Admin Panel", callback_data: "admin_panel" }]);
+  const list = agents.length ? agents.map((agent, i) => `${i + 1}. ${agent.name} (@${agent.username})`).join("\n") : "এখনো কোনো Support Agent যোগ করা হয়নি।";
+  return bot.sendMessage(chatId, `🆘 Support Agents\n\n${list}\n\nএজেন্টের Telegram username যোগ করুন, যেমন: @support_name | Support Team`, { reply_markup: { inline_keyboard: rows } });
+}
+
+async function showCustomerSupport(chatId, uid) {
+  const agents = db.supportAgents || [];
+  if (!agents.length) return bot.sendMessage(chatId, localized(uid, "⚠️ এখনো কোনো Support Agent যোগ করা হয়নি।", "⚠️ No support agents are available yet."), { reply_markup: customerKeyboard(uid) });
+  const buttons = agents.map(agent => [{ text: `💬 ${agent.name}`, url: `https://t.me/${agent.username}` }]);
+  const text = localized(uid, "🆘 কাস্টমার সাপোর্ট\nনিচের এজেন্টের সাথে যোগাযোগ করুন:", "🆘 Customer Support\nChoose an agent to contact:");
+  return bot.sendMessage(chatId, text, { reply_markup: { inline_keyboard: buttons } });
+}
+
 async function showAccountDetails(chatId, uid) {
   const user = db.users[String(uid)] || { id: uid };
   const orders = Object.values(db.orders || {}).filter(o => String(o.userId) === String(uid));
@@ -379,10 +551,9 @@ async function showAccountDetails(chatId, uid) {
   const completed = orders.filter(o => String(o.status || '').toLowerCase() === 'completed');
   const firstSeen = user.createdAt || user.joinedAt || '-';
   const lastSeen = user.lastSeen || '-';
-  return bot.sendMessage(chatId,
-    `👤 Account Details\n\n🆔 User ID: ${user.id || uid}\n📛 Username: ${user.username ? '@' + user.username : 'নেই'}\n👤 Name: ${user.firstName || 'নেই'}\n💰 Current Balance: ৳${money(getBalance(uid))}\n📦 Total Orders: ${orders.length}\n💵 Total Order Value: ৳${money(totalSpent)}\n✅ Completed Orders: ${completed.length}\n🕒 Last Seen: ${lastSeen}\n🗓️ Joined: ${firstSeen}`,
-    { reply_markup: customerKeyboard(uid) }
-  );
+  const bn = `👤 অ্যাকাউন্ট তথ্য\n\n🆔 User ID: ${user.id || uid}\n📛 ইউজারনেম: ${user.username ? '@' + user.username : 'নেই'}\n👤 নাম: ${user.firstName || 'নেই'}\n💰 বর্তমান ব্যালেন্স: ৳${money(getBalance(uid))}\n📦 মোট অর্ডার: ${orders.length}\n💵 অর্ডারের মোট মূল্য: ৳${money(totalSpent)}\n✅ সম্পন্ন অর্ডার: ${completed.length}\n🕒 সর্বশেষ সক্রিয়: ${lastSeen}\n🗓️ যোগদানের তারিখ: ${firstSeen}`;
+  const en = `👤 Account Details\n\n🆔 User ID: ${user.id || uid}\n📛 Username: ${user.username ? '@' + user.username : 'Not set'}\n👤 Name: ${user.firstName || 'Not set'}\n💰 Current Balance: ৳${money(getBalance(uid))}\n📦 Total Orders: ${orders.length}\n💵 Total Order Value: ৳${money(totalSpent)}\n✅ Completed Orders: ${completed.length}\n🕒 Last Seen: ${lastSeen}\n🗓️ Joined: ${firstSeen}`;
+  return bot.sendMessage(chatId, localized(uid, bn, en), { reply_markup: customerKeyboard(uid) });
 }
 
 async function showCustomerList(chatId) {
@@ -440,9 +611,14 @@ async function handleAdminAction(id, uid, action) {
   if (action === "set price") { setState(uid, { type: "set_price" }); return bot.sendMessage(id, "💰 Price/1K সেট করুন।\nফরম্যাট: ServiceID Price\nউদাহরণ: 979 150"); }
   if (action === "increase price") { setState(uid, { type: "increase_price" }); return bot.sendMessage(id, "⬆️ কত টাকা/1K বাড়াবেন?\nফরম্যাট: ServiceID Amount\nউদাহরণ: 979 20"); }
   if (action === "decrease price") { setState(uid, { type: "decrease_price" }); return bot.sendMessage(id, "⬇️ কত টাকা/1K কমাবেন?\nফরম্যাট: ServiceID Amount\nউদাহরণ: 979 20"); }
-  if (action === "payment numbers") return showPaymentNumbers(id);
+  if (action === "payment numbers") return showPaymentNumbers(id, uid);
   if (action === "change payment number") { setState(uid, { type: "payment_change" }); return bot.sendMessage(id, "✏️ নতুন payment number দিন。\nএটি বর্তমান payment number list replace করবে。"); }
-  if (action === "payment requests") return showPaymentRequests(id);
+  if (action === "payment requests") return showPaymentRequests(id, uid);
+  if (action === "manager payment summary") return showManagerPaymentSummary(id);
+  if (action === "support agents") {
+    if (!isOwner(uid)) return bot.sendMessage(id, "⛔ শুধু Admin Support Agent পরিচালনা করতে পারবেন।");
+    clearState(uid); return showSupportAgentsAdmin(id);
+  }
   if (action === "user count") return bot.sendMessage(id, `👥 Registered users: ${Object.keys(db.users).length}`);
   if (action === "customer details") { clearState(uid); return showCustomerList(id); }
   if (action === "customer menu") { clearState(uid); return bot.sendMessage(id, "🏠 Customer Menu", { reply_markup: customerKeyboard(uid) }); }
@@ -470,10 +646,10 @@ async function showReferral(chatId, uid) {
   const referred = Object.values(db.users).filter(u => String(u.referredBy || '') === String(uid)).length;
   const earned = Number(user.referralEarnings || 0);
   const link = getReferralLink(uid, username);
-  return bot.sendMessage(chatId,
-    `👥 Referral Program\n\n🔗 আপনার Referral Link:\n${link}\n\n👥 Total Referrals: ${referred}\n💰 Total Commission: ৳${money(earned)}\n\n🎁 কোনো নতুন customer আপনার link দিয়ে bot-এ আসবে এবং তার completed order-এর মূল্য কমপক্ষে ৳${money(db.referral.minOrder)} হলে, আপনি ওই customer-এর প্রথম completed ৳50+ order হলে একবারই ৳5 পাবেন।\n\nউদাহরণ: ৳50 বা তার বেশি order → একবার ৳5 reward।`,
-    { reply_markup: customerKeyboard(uid) }
-  );
+  const min = money(db.referral.minOrder);
+  const bn = `👥 রেফারেল প্রোগ্রাম\n\n🔗 আপনার রেফারেল লিংক:\n${link}\n\n👥 মোট রেফারেল: ${referred}\n💰 মোট কমিশন: ৳${money(earned)}\n\n🎁 আপনার লিংক দিয়ে আসা নতুন কাস্টমারের প্রথম ৳${min} বা তার বেশি মূল্যের অর্ডার সম্পন্ন হলে আপনি একবার ৳5 পাবেন।`;
+  const en = `👥 Referral Program\n\n🔗 Your referral link:\n${link}\n\n👥 Total referrals: ${referred}\n💰 Total commission: ৳${money(earned)}\n\n🎁 You earn ৳5 once when a customer who joined through your link completes their first order of at least ৳${min}.`;
+  return bot.sendMessage(chatId, localized(uid, bn, en), { reply_markup: customerKeyboard(uid) });
 }
 
 async function processReferralStart(msg, startArg) {
@@ -492,37 +668,46 @@ async function processReferralStart(msg, startArg) {
 
 async function startNewOrder(chatId, uid) {
   try {
-    const all = await getServices();
-    const selected = all.filter(s => db.serviceIds.includes(String(s.service ?? s.id ?? "")));
-    if (!selected.length) return bot.sendMessage(chatId, "⚠️ কোনো service পাওয়া যায়নি। Admin আগে Service ID যোগ করুন।");
-    const buttons = selected.slice(0, 60).map(s => {
-      const sid = String(s.service ?? s.id);
-      const p = db.prices[sid] !== undefined ? Number(db.prices[sid]) : Number(s.rate || 0);
-      return [{ text: `${sid} • ${String(s.name || "Service").slice(0, 38)} • ৳${money(p)}/1K`, callback_data: `order_service:${sid}` }];
-    });
-    return bot.sendMessage(chatId, `🛒 New Order\n\n💰 আপনার Balance: ৳${money(getBalance(uid))}\n\nএকটি service নির্বাচন করুন:`, { reply_markup: { inline_keyboard: buttons } });
+    const groups = await loadSelectedServiceGroups();
+    if (!groups.length) return bot.sendMessage(chatId, localized(uid, "⚠️ কোনো সার্ভিস পাওয়া যায়নি। Admin আগে Service ID যোগ করুন।", "⚠️ No services found. Ask the Admin to add service IDs."));
+    return bot.sendMessage(chatId, localized(uid, `🛒 নতুন অর্ডার\n\n💰 আপনার ব্যালেন্স: ৳${money(getBalance(uid))}\n\nআগে একটি ক্যাটাগরি নির্বাচন করুন:`, `🛒 New Order\n\n💰 Your balance: ৳${money(getBalance(uid))}\n\nChoose a category first:`), { reply_markup: categoryKeyboard(groups, "order_cat", uid) });
   } catch (e) {
     console.error("New order services error:", e.response?.data || e.message);
-    return bot.sendMessage(chatId, "❌ Service list আনা যায়নি।");
+    return bot.sendMessage(chatId, localized(uid, "❌ সার্ভিস তালিকা আনা যায়নি।", "❌ Could not load the service list."));
   }
 }
 
 async function showAddBalance(chatId) {
-  const pm = db.paymentMethods || {};
-  const buttons = Object.entries(pm).filter(([, number]) => number).map(([method, number]) => [{ text: `${method} • ${number}`, callback_data: `deposit_method:${method}` }]);
-  if (!buttons.length) return bot.sendMessage(chatId, "⚠️ Admin এখনো কোনো payment method সেট করেননি।");
+  const buttons = [];
+  for (const [method, number] of Object.entries(db.paymentMethods || {})) {
+    const code = PAYMENT_METHOD_CODES[method];
+    if (number && code) buttons.push([{ text: `👑 Admin • ${method} • ${number}`, callback_data: `deposit_method:a:${code}` }]);
+  }
+  for (const managerId of db.managers || []) {
+    const methods = db.managerPaymentMethods?.[String(managerId)] || {};
+    for (const [method, number] of Object.entries(methods)) {
+      const code = PAYMENT_METHOD_CODES[method];
+      if (number && code) buttons.push([{ text: `👤 Manager • ${method} • ${number}`, callback_data: `deposit_method:m:${managerId}:${code}` }]);
+    }
+  }
+  if (!buttons.length) return bot.sendMessage(chatId, localized(chatId, "⚠️ এখনো কোনো Admin বা Manager পেমেন্ট মেথড সেট করা হয়নি।", "⚠️ No Admin or Manager payment methods have been set yet."));
   clearState(chatId);
-  return bot.sendMessage(chatId, `💳 Add Balance\n\nএকটি Payment Method নির্বাচন করুন:`, { reply_markup: { inline_keyboard: buttons } });
+  return bot.sendMessage(chatId, localized(chatId, "💳 ব্যালেন্স যোগ\n\nযে নম্বরে টাকা পাঠাবেন সেটি নির্বাচন করুন। Admin ও Manager-এর নম্বর আলাদা করে দেখানো হয়েছে:", "💳 Add Balance\n\nChoose the number you will pay. Admin and Manager accounts are shown separately:"), { reply_markup: { inline_keyboard: buttons } });
 }
 
 async function submitDeposit(chatId, uid, amount) {
-  if (!Number.isFinite(amount) || amount <= 0) return bot.sendMessage(chatId, "⚠️ সঠিক amount দিন। উদাহরণ: 100");
+  if (!Number.isFinite(amount) || amount <= 0) return bot.sendMessage(chatId, localized(uid, "⚠️ সঠিক পরিমাণ লিখুন। উদাহরণ: 100", "⚠️ Enter a valid amount. Example: 100"));
   const state = getState(uid);
   const method = state?.paymentMethod || "";
-  const number = db.paymentMethods?.[method] || "";
-  if (!method || !number) return bot.sendMessage(chatId, "⚠️ Payment Method নির্বাচন করুন।", { reply_markup: { inline_keyboard: Object.entries(db.paymentMethods || {}).filter(([,n])=>n).map(([m,n])=>[{text:`${m} • ${n}`,callback_data:`deposit_method:${m}`}]) } });
-  setState(uid, { type: "deposit_txid", amount, paymentMethod: method, paymentNumber: number });
-  return bot.sendMessage(chatId, `💵 Amount: ৳${money(amount)}\n💳 Method: ${method}\n📱 Number: ${number}\n\nএখন আপনার Transaction ID/TrxID পাঠান।\nউদাহরণ: TX123456789`);
+  const paymentOwner = state?.paymentOwner || "admin";
+  const managerId = String(state?.paymentManagerId || "");
+  const number = paymentOwner === "manager"
+    ? db.managerPaymentMethods?.[managerId]?.[method] || ""
+    : db.paymentMethods?.[method] || "";
+  if (!method || !number || (paymentOwner === "manager" && !db.managers.includes(managerId)))
+    return bot.sendMessage(chatId, localized(uid, "⚠️ এই পেমেন্ট মেথড আর চালু নেই। ব্যালেন্স যোগ থেকে নতুন নম্বর বেছে নিন।", "⚠️ This payment method is no longer available. Choose another number from Add Balance."));
+  setState(uid, { type: "deposit_txid", amount, paymentMethod: method, paymentNumber: number, paymentOwner, paymentManagerId: paymentOwner === "manager" ? managerId : "" });
+  return bot.sendMessage(chatId, localized(uid, `💵 পরিমাণ: ৳${money(amount)}\n💳 মেথড: ${method}\n📱 নম্বর: ${number}\n\nএখন Transaction ID/TrxID পাঠান।\nউদাহরণ: TX123456789`, `💵 Amount: ৳${money(amount)}\n💳 Method: ${method}\n📱 Number: ${number}\n\nNow send your transaction ID/TrxID.\nExample: TX123456789`));
 }
 
 bot.onText(/^\/start(?:\s+(.+))?$/i, async (msg, match) => {
@@ -530,7 +715,8 @@ bot.onText(/^\/start(?:\s+(.+))?$/i, async (msg, match) => {
   const arg = String(match?.[1] || '').trim();
   await processReferralStart(msg, arg);
   clearState(msg.from.id);
-  await bot.sendMessage(msg.chat.id, "👋 স্বাগতম!\n\n🤖 Trusted BAZAAR SMM Bot\n\nনিচের মেনু থেকে অপশন নির্বাচন করুন।", { reply_markup: customerKeyboard(msg.from.id) });
+  if (!db.users[String(msg.from.id)]?.language) return showLanguagePicker(msg.chat.id, msg.from.id);
+  await bot.sendMessage(msg.chat.id, localized(msg.from.id, "👋 স্বাগতম!\n\n🤖 Trusted BAZAAR SMM Bot\n\nনিচের মেনু থেকে অপশন নির্বাচন করুন।", "👋 Welcome!\n\n🤖 Trusted BAZAAR SMM Bot\n\nChoose an option from the menu below."), { reply_markup: customerKeyboard(msg.from.id) });
 });
 bot.onText(/^\/admin$/i, async msg => {
   await rememberUser(msg); if (!isAdmin(msg.from.id)) return bot.sendMessage(msg.chat.id, "⛔ এই মেনু শুধু Admin/Manager-এর জন্য。");
@@ -543,19 +729,45 @@ bot.on("callback_query", async q => {
   try {
     const uid = q.from.id, chatId = q.message.chat.id, data = String(q.data || "");
     await bot.answerCallbackQuery(q.id);
+    if (data.startsWith("language:")) {
+      const language = data.slice("language:".length);
+      if (!["bn", "en"].includes(language)) return;
+      db.users[String(uid)] = { ...(db.users[String(uid)] || { id: uid }), language };
+      await saveDb();
+      return bot.sendMessage(chatId, language === "en" ? "✅ Language set to English." : "✅ ভাষা বাংলা করা হয়েছে।", { reply_markup: customerKeyboard(uid) });
+    }
+    if (data === "browse_categories") return sendCustomerServices(chatId);
+    if (data.startsWith("browse_cat:")) return showCategoryServices(chatId, data.slice("browse_cat:".length));
+    if (data === "order_categories") return startNewOrder(chatId, uid);
+    if (data.startsWith("order_cat:")) {
+      const [, categoryId, page] = data.split(":");
+      return showOrderCategory(chatId, uid, categoryId, page);
+    }
     if (data.startsWith("order_service:")) {
       const sid = data.split(":")[1];
       const all = await getServices(); const s = selectedServiceInfo(all, sid);
-      if (!s) return bot.sendMessage(chatId, "❌ Service পাওয়া যায়নি।");
+      if (!s) return bot.sendMessage(chatId, localized(uid, "❌ সার্ভিস পাওয়া যায়নি।", "❌ Service not found."));
       setState(uid, { type: "order_link", serviceId: sid, service: s });
-      return bot.sendMessage(chatId, `📌 ${s.name}\n💰 Price: ৳${money(s.price)}/1K\n🔢 Min: ${s.min || "-"} | Max: ${s.max || "-"}\n\n🔗 এখন আপনার Link/Username পাঠান:`);
+      return bot.sendMessage(chatId, localized(uid, `📌 ${s.name}\n💰 দাম: ৳${money(s.price)}/১K\n🔢 সর্বনিম্ন: ${s.min || "-"} | সর্বোচ্চ: ${s.max || "-"}\n\n🔗 আপনার Link/Username পাঠান:`, `📌 ${s.name}\n💰 Price: ৳${money(s.price)}/1K\n🔢 Min: ${s.min || "-"} | Max: ${s.max || "-"}\n\n🔗 Send your link/username:`));
     }
     if (data.startsWith("deposit_method:")) {
-      const method = data.split(":").slice(1).join(":");
-      const number = db.paymentMethods?.[method] || "";
-      if (!number) return bot.sendMessage(chatId, "⚠️ এই payment method এখনো সেট করা হয়নি।");
-      setState(uid, { type: "deposit_amount_method", paymentMethod: method, paymentNumber: number });
-      return bot.sendMessage(chatId, `💳 ${method}\n📱 Number: ${number}\n\nকত টাকা পাঠিয়েছেন লিখুন।\nউদাহরণ: 100`);
+      const parts = data.split(":");
+      let paymentOwner = "admin", managerId = "", method = "";
+      if (parts.length === 2) {
+        // Old payment buttons are treated as Admin-owned for compatibility.
+        method = parts[1];
+      } else if (parts[1] === "a") {
+        method = PAYMENT_METHODS[parts[2]] || "";
+      } else if (parts[1] === "m") {
+        paymentOwner = "manager"; managerId = String(parts[2] || ""); method = PAYMENT_METHODS[parts[3]] || "";
+      }
+      const number = paymentOwner === "manager"
+        ? db.managerPaymentMethods?.[managerId]?.[method] || ""
+        : db.paymentMethods?.[method] || "";
+      if (paymentOwner === "manager" && !db.managers.includes(managerId)) return bot.sendMessage(chatId, localized(uid, "⚠️ এই Manager পেমেন্ট অ্যাকাউন্ট আর চালু নেই।", "⚠️ This Manager payment account is no longer active."));
+      if (!number) return bot.sendMessage(chatId, localized(uid, "⚠️ এই পেমেন্ট মেথড এখনো সেট করা হয়নি।", "⚠️ This payment method has not been set yet."));
+      setState(uid, { type: "deposit_amount_method", paymentMethod: method, paymentNumber: number, paymentOwner, paymentManagerId: managerId });
+      return bot.sendMessage(chatId, localized(uid, `💳 ${paymentOwner === "admin" ? "Admin" : `Manager ${managerId}`} • ${method}\n📱 নম্বর: ${number}\n\nকত টাকা পাঠিয়েছেন লিখুন।\nউদাহরণ: 100`, `💳 ${paymentOwner === "admin" ? "Admin" : `Manager ${managerId}`} • ${method}\n📱 Number: ${number}\n\nEnter the amount you paid.\nExample: 100`));
     }
     if (data === "admin_panel") {
       if (!isAdmin(uid)) return;
@@ -567,10 +779,24 @@ bot.on("callback_query", async q => {
       setState(uid, { type: "manager_add" });
       return bot.sendMessage(chatId, "➕ Manager-এর Telegram numeric User ID পাঠান।\nউদাহরণ: 123456789\nতাকে /myid পাঠিয়ে ID জানাতে বলুন।");
     }
+    if (data === "support_agent_add") {
+      if (!isOwner(uid)) return bot.sendMessage(chatId, "⛔ শুধু Admin Support Agent যোগ করতে পারবেন।");
+      setState(uid, { type: "support_agent_add" });
+      return bot.sendMessage(chatId, "➕ Telegram username পাঠান।\nউদাহরণ: @support_name | Support Team\nনাম বাদ দিলে username-টাই নাম হিসেবে দেখাবে।");
+    }
+    if (data.startsWith("support_agent_remove:")) {
+      if (!isOwner(uid)) return bot.sendMessage(chatId, "⛔ শুধু Admin Support Agent বাদ দিতে পারবেন।");
+      const username = data.slice("support_agent_remove:".length).toLowerCase();
+      db.supportAgents = db.supportAgents.filter(agent => agent.username.toLowerCase() !== username);
+      await saveDb();
+      return showSupportAgentsAdmin(chatId);
+    }
     if (data.startsWith("manager_remove:")) {
       if (!isOwner(uid)) return bot.sendMessage(chatId, "⛔ শুধু Owner manager বাদ দিতে পারবেন।");
       const managerId = data.split(":")[1];
       if (!db.managers.includes(managerId)) return showManagers(chatId);
+      const openPayments = Object.values(db.deposits || {}).filter(d => d.status === "pending" && d.paymentOwner === "manager" && String(d.paymentManagerId) === managerId).length;
+      if (openPayments) return bot.sendMessage(chatId, `⚠️ এই Manager-এর ${openPayments}টি payment request pending আছে। আগে সেগুলো resolve করুন, তারপর Manager-কে বাদ দিন।`, { reply_markup: { inline_keyboard: [[{ text: "🔙 Admin Panel", callback_data: "admin_panel" }]] } });
       db.managers = db.managers.filter(id => id !== managerId);
       await saveDb();
       try { await bot.sendMessage(managerId, "ℹ️ আপনার Manager access সরিয়ে দেওয়া হয়েছে।"); } catch (_) {}
@@ -590,9 +816,13 @@ bot.on("callback_query", async q => {
     }
     if (data.startsWith("admin_pay_method:")) {
       if (!isAdmin(uid)) return;
-      const method = data.split(":").slice(1).join(":");
-      if (!["বিকাশ", "নগদ", "বাইন্সাস"].includes(method)) return;
-      setState(uid, { type: "payment_method_set", method });
+      const [, ownerType, code] = data.split(":");
+      const method = PAYMENT_METHODS[code];
+      if (!method) return;
+      if (ownerType === "a" && !isOwner(uid)) return;
+      if (ownerType === "m" && !isManager(uid)) return;
+      if (!['a', 'm'].includes(ownerType)) return;
+      setState(uid, { type: "payment_method_set", method, paymentOwner: ownerType === "a" ? "admin" : "manager" });
       return bot.sendMessage(chatId, `✏️ ${method}-এর payment number/account number পাঠান।`);
     }
     if (data === "admin_pay_add") {
@@ -615,16 +845,21 @@ bot.on("callback_query", async q => {
       if (!isAdmin(uid)) return;
       const [action, depId] = data.split(":"); const d = db.deposits[depId];
       if (!d || d.status !== "pending") return bot.sendMessage(chatId, "⚠️ এই payment request আর pending নেই।");
+      const paymentOwner = d.paymentOwner || "admin";
+      const canReview = paymentOwner === "manager"
+        ? isManager(uid) && String(d.paymentManagerId) === String(uid)
+        : isOwner(uid);
+      if (!canReview) return bot.sendMessage(chatId, "⛔ এই payment request অন্য account-এর। সংশ্লিষ্ট payment account-এর owner-ই এটি approve/reject করতে পারবেন।");
       if (action === "dep_approve") {
         d.status = "approved"; d.approvedAt = new Date().toISOString(); d.approvedBy = uid;
         setBalance(d.userId, getBalance(d.userId) + Number(d.amount));
         await saveDb();
-        await bot.sendMessage(d.userId, `✅ আপনার payment approved হয়েছে।\n💵 Added: ৳${money(d.amount)}\n💰 New Balance: ৳${money(getBalance(d.userId))}`, { reply_markup: customerKeyboard(d.userId) });
+        await bot.sendMessage(d.userId, localized(d.userId, `✅ আপনার পেমেন্ট অনুমোদিত হয়েছে।\n💵 যোগ হয়েছে: ৳${money(d.amount)}\n💰 নতুন ব্যালেন্স: ৳${money(getBalance(d.userId))}`, `✅ Your payment was approved.\n💵 Added: ৳${money(d.amount)}\n💰 New balance: ৳${money(getBalance(d.userId))}`), { reply_markup: customerKeyboard(d.userId) });
         return bot.sendMessage(chatId, `✅ Payment ${depId} approved.\nUser: ${d.userId}\nAmount: ৳${money(d.amount)}`, { reply_markup: adminKeyboard(chatId) });
       }
       d.status = "rejected"; d.rejectedAt = new Date().toISOString(); d.rejectedBy = uid;
       await saveDb();
-      await bot.sendMessage(d.userId, `❌ আপনার payment request rejected হয়েছে।\n🆔 ${depId}`);
+      await bot.sendMessage(d.userId, localized(d.userId, `❌ আপনার পেমেন্ট রিকোয়েস্ট বাতিল হয়েছে।\n🆔 ${depId}`, `❌ Your payment request was rejected.\n🆔 ${depId}`));
       return bot.sendMessage(chatId, `❌ Payment ${depId} rejected.`, { reply_markup: adminKeyboard(chatId) });
     }
   } catch (e) { console.error("Callback error:", e.stack || e.message); }
@@ -648,7 +883,7 @@ bot.on('message', async msg => {
       const adminActions = new Set(isOwner(uid) ? [
         'admin panel','manage services','add service id','remove service id','set price',
         'increase price','decrease price','payment numbers','change payment number',
-        'payment requests','user count','customer details','customer menu','manage managers'
+        'payment requests','user count','customer details','customer menu','manage managers','manager payment summary','support agents'
       ] : ['admin panel','payment numbers','payment requests','customer menu']);
       if (adminActions.has(action)) {
         console.log(`[ADMIN ACTION] uid=${uid} action=${action}`);
@@ -663,7 +898,7 @@ bot.on('message', async msg => {
     }
     if (action === 'balance') {
       clearState(uid);
-      return await bot.sendMessage(chatId, `💰 Your Balance\n\n৳${money(getBalance(uid))}`, { reply_markup: customerKeyboard(uid) });
+      return await bot.sendMessage(chatId, localized(uid, `💰 আপনার ব্যালেন্স\n\n৳${money(getBalance(uid))}`, `💰 Your Balance\n\n৳${money(getBalance(uid))}`), { reply_markup: customerKeyboard(uid) });
     }
     if (action === 'account details') {
       clearState(uid);
@@ -680,13 +915,21 @@ bot.on('message', async msg => {
     if (action === 'my orders') {
       clearState(uid);
       const orders = Object.values(db.orders).filter(o => String(o.userId) === String(uid));
-      if (!orders.length) return await bot.sendMessage(chatId, '📦 My Orders\n\nআপনার কোনো order পাওয়া যায়নি।', { reply_markup: customerKeyboard(uid) });
-      const lines = orders.slice(-20).reverse().map(o => `🆔 ${o.id}\n📌 Service: ${o.serviceId}\n🔗 ${o.link}\n🔢 Qty: ${o.quantity}\n💵 Cost: ৳${money(o.cost)}\n📊 Status: ${o.status || 'Pending'}${o.providerOrderId ? `\n🔢 Provider Order: ${o.providerOrderId}` : ''}`);
-      return await bot.sendMessage(chatId, `📦 My Orders\n\n${lines.join('\n\n')}`, { reply_markup: customerKeyboard(uid) });
+      if (!orders.length) return await bot.sendMessage(chatId, localized(uid, '📦 আমার অর্ডার\n\nএখনো কোনো অর্ডার নেই।', '📦 My Orders\n\nYou have no orders yet.'), { reply_markup: customerKeyboard(uid) });
+      const lines = orders.slice(-20).reverse().map(o => localized(uid, `🆔 ${o.id}\n📌 সার্ভিস: ${o.serviceName || o.serviceId}\n🔗 ${o.link}\n🔢 পরিমাণ: ${o.quantity}\n💵 মূল্য: ৳${money(o.cost)}\n📊 অবস্থা: ${o.status || 'Pending'}${o.providerOrderId ? `\n🔢 Provider Order: ${o.providerOrderId}` : ''}`, `🆔 ${o.id}\n📌 Service: ${o.serviceName || o.serviceId}\n🔗 ${o.link}\n🔢 Quantity: ${o.quantity}\n💵 Cost: ৳${money(o.cost)}\n📊 Status: ${o.status || 'Pending'}${o.providerOrderId ? `\n🔢 Provider Order: ${o.providerOrderId}` : ''}`));
+      return await bot.sendMessage(chatId, localized(uid, `📦 আমার অর্ডার\n\n${lines.join('\n\n')}`, `📦 My Orders\n\n${lines.join('\n\n')}`), { reply_markup: customerKeyboard(uid) });
     }
     if (action === 'referral') {
       clearState(uid);
       return await showReferral(chatId, uid);
+    }
+    if (action === 'support') {
+      clearState(uid);
+      return await showCustomerSupport(chatId, uid);
+    }
+    if (action === 'language') {
+      clearState(uid);
+      return await showLanguagePicker(chatId, uid);
     }
 
     const state = getState(uid);
@@ -700,28 +943,35 @@ bot.on('message', async msg => {
     }
     if (state?.type === 'deposit_txid') {
       const txId = text.trim();
-      if (txId.length < 3 || txId.length > 100) return await bot.sendMessage(chatId, '⚠️ সঠিক Transaction ID দিন।');
+      if (txId.length < 3 || txId.length > 100) return await bot.sendMessage(chatId, localized(uid, '⚠️ সঠিক Transaction ID দিন।', '⚠️ Enter a valid transaction ID.'));
       const depId = `DEP-${Date.now()}-${String(uid).slice(-5)}`;
-      db.deposits[depId] = { id: depId, userId: uid, amount: Number(state.amount), paymentMethod: state.paymentMethod || '', paymentNumber: state.paymentNumber || db.paymentMethods?.[state.paymentMethod] || db.paymentNumbers[0], txId, status: 'pending', createdAt: new Date().toISOString() };
+      const paymentOwner = state.paymentOwner || 'admin';
+      const paymentManagerId = paymentOwner === 'manager' ? String(state.paymentManagerId || '') : '';
+      db.deposits[depId] = { id: depId, userId: uid, amount: Number(state.amount), paymentMethod: state.paymentMethod || '', paymentNumber: state.paymentNumber || '', paymentOwner, paymentManagerId, txId, status: 'pending', createdAt: new Date().toISOString() };
       await saveDb(); clearState(uid);
-      await bot.sendMessage(chatId, `✅ Payment request পাঠানো হয়েছে।\n🆔 ${depId}\n💵 Amount: ৳${money(state.amount)}\n🔖 TxID: ${txId}\n\nAdmin approve করলে balance যোগ হবে।`, { reply_markup: customerKeyboard(uid) });
-      await notifyStaff(`🔔 নতুন payment request এসেছে।\n🆔 ${depId}\n👤 User: ${uid}\n💵 Amount: ৳${money(state.amount)}\n🔖 TxID: ${txId}`, { reply_markup: { inline_keyboard: [[{ text: '✅ Approve', callback_data: `dep_approve:${depId}` }, { text: '❌ Reject', callback_data: `dep_reject:${depId}` }]] } });
+      await bot.sendMessage(chatId, localized(uid, `✅ পেমেন্ট রিকোয়েস্ট পাঠানো হয়েছে।\n🆔 ${depId}\n💵 পরিমাণ: ৳${money(state.amount)}\n🔖 TxID: ${txId}\n\nনির্বাচিত payment account-এর owner অনুমোদন করলে ব্যালেন্স যোগ হবে।`, `✅ Payment request submitted.\n🆔 ${depId}\n💵 Amount: ৳${money(state.amount)}\n🔖 TxID: ${txId}\n\nYour balance will be added after the selected payment account owner approves it.`), { reply_markup: customerKeyboard(uid) });
+      const reviewerId = paymentOwner === 'manager' ? paymentManagerId : ADMIN_ID;
+      if (reviewerId) {
+        try {
+          await bot.sendMessage(reviewerId, `🔔 নতুন payment request এসেছে।\n🆔 ${depId}\n👤 User: ${uid}\n💵 Amount: ৳${money(state.amount)}\n💳 Account: ${paymentOwner === 'manager' ? `Manager ${paymentManagerId}` : 'Admin'} • ${state.paymentMethod}\n📱 Number: ${state.paymentNumber}\n🔖 TxID: ${txId}`, { reply_markup: { inline_keyboard: [[{ text: '✅ Approve', callback_data: `dep_approve:${depId}` }, { text: '❌ Reject', callback_data: `dep_reject:${depId}` }]] } });
+        } catch (notifyErr) { console.error(`Payment notification failed for ${reviewerId}:`, notifyErr.response?.body || notifyErr.message); }
+      }
       return;
     }
 
     if (state?.type === 'order_link') {
-      if (!text) return await bot.sendMessage(chatId, '⚠️ Link দিন।');
+      if (!text) return await bot.sendMessage(chatId, localized(uid, '⚠️ একটি Link দিন।', '⚠️ Send a link.'));
       setState(uid, { ...state, type: 'order_quantity', link: text });
-      return await bot.sendMessage(chatId, `🔢 Quantity লিখুন।\nMin: ${state.service.min || '-'}\nMax: ${state.service.max || '-'}\n\nউদাহরণ: 1000`);
+      return await bot.sendMessage(chatId, localized(uid, `🔢 পরিমাণ লিখুন।\nসর্বনিম্ন: ${state.service.min || '-'}\nসর্বোচ্চ: ${state.service.max || '-'}\n\nউদাহরণ: 1000`, `🔢 Enter quantity.\nMin: ${state.service.min || '-'}\nMax: ${state.service.max || '-'}\n\nExample: 1000`));
     }
     if (state?.type === 'order_quantity') {
       const quantity = Number(text.replace(/,/g, ''));
       const min = Number(state.service.min || 0), max = Number(state.service.max || Number.MAX_SAFE_INTEGER);
-      if (!Number.isInteger(quantity) || quantity <= 0 || quantity < min || quantity > max) return await bot.sendMessage(chatId, `⚠️ Quantity সঠিক নয়। Min ${min}, Max ${max}।`);
+      if (!Number.isInteger(quantity) || quantity <= 0 || quantity < min || quantity > max) return await bot.sendMessage(chatId, localized(uid, `⚠️ পরিমাণটি সঠিক নয়। সর্বনিম্ন ${min}, সর্বোচ্চ ${max}।`, `⚠️ Invalid quantity. Minimum ${min}, maximum ${max}.`));
       const cost = Number(state.service.price) * quantity / 1000;
       if (getBalance(uid) < cost) {
         clearState(uid);
-        return await bot.sendMessage(chatId, `❌ আপনার Balance কম।\nপ্রয়োজন: ৳${money(cost)}\nবর্তমান: ৳${money(getBalance(uid))}\n\nআগে 💳 Add Balance করুন।`, { reply_markup: customerKeyboard(uid) });
+        return await bot.sendMessage(chatId, localized(uid, `❌ আপনার ব্যালেন্স কম।\nপ্রয়োজন: ৳${money(cost)}\nবর্তমান: ৳${money(getBalance(uid))}\n\nআগে 💳 ব্যালেন্স যোগ করুন।`, `❌ Insufficient balance.\nRequired: ৳${money(cost)}\nAvailable: ৳${money(getBalance(uid))}\n\nPlease use 💳 Add Balance first.`), { reply_markup: customerKeyboard(uid) });
       }
       const orderId = `ORD-${Date.now()}-${String(uid).slice(-5)}`;
       try {
@@ -736,7 +986,7 @@ bot.on('message', async msg => {
         const adminText = `🔔 NEW ORDER RECEIVED\n\n🆔 Order: ${orderId}\n👤 User ID: ${uid}\n${db.users[String(uid)]?.username ? `📛 Username: @${db.users[String(uid)].username}\n` : ''}📌 Service ID: ${state.serviceId}\n🔗 Link: ${state.link}\n🔢 Quantity: ${quantity}\n💵 Customer Cost: ৳${money(cost)}\n💰 User Balance: ৳${money(getBalance(uid))}\n📊 Status: Submitted${providerOrderId ? `\n🔢 Provider Order: ${providerOrderId}` : ''}\n🌐 API: ${SMM_API_URL}`;
         await notifyOwner(adminText, { reply_markup: { inline_keyboard: [[{ text: '📋 Admin Panel', callback_data: 'admin_panel' }]] } });
 
-        return await bot.sendMessage(chatId, `✅ Order submitted successfully!\n\n🆔 ${orderId}\n📌 Service: ${state.serviceId}\n🔢 Quantity: ${quantity}\n💵 Cost: ৳${money(cost)}\n💰 Balance: ৳${money(getBalance(uid))}${providerOrderId ? `\n🔢 Provider Order: ${providerOrderId}` : ''}`, { reply_markup: customerKeyboard(uid) });
+        return await bot.sendMessage(chatId, localized(uid, `✅ অর্ডার সফলভাবে পাঠানো হয়েছে!\n\n🆔 ${orderId}\n📌 সার্ভিস: ${state.service?.name || state.serviceId}\n🔢 পরিমাণ: ${quantity}\n💵 খরচ: ৳${money(cost)}\n💰 ব্যালেন্স: ৳${money(getBalance(uid))}${providerOrderId ? `\n🔢 Provider Order: ${providerOrderId}` : ''}`, `✅ Order submitted successfully!\n\n🆔 ${orderId}\n📌 Service: ${state.service?.name || state.serviceId}\n🔢 Quantity: ${quantity}\n💵 Cost: ৳${money(cost)}\n💰 Balance: ৳${money(getBalance(uid))}${providerOrderId ? `\n🔢 Provider Order: ${providerOrderId}` : ''}`), { reply_markup: customerKeyboard(uid) });
       } catch (e) {
         console.error('Provider order error:', e.response?.data || e.message);
         await notifyOwner(`⚠️ ORDER FAILED
@@ -747,7 +997,7 @@ bot.on('message', async msg => {
 🔢 Quantity: ${quantity}
 💵 Intended Cost: ৳${money(cost)}
 ❌ Error: ${e.response?.data?.error || e.message}`);
-        return await bot.sendMessage(chatId, `❌ Provider order করা যায়নি।\n\n${e.response?.data?.error || e.message}\n\nআপনার Balance কাটা হয়নি।`);
+        return await bot.sendMessage(chatId, localized(uid, `❌ অর্ডারটি পাঠানো যায়নি।\n\n${e.response?.data?.error || e.message}\n\nআপনার ব্যালেন্স কাটা হয়নি।`, `❌ Could not submit the order.\n\n${e.response?.data?.error || e.message}\n\nYour balance was not charged.`));
       }
     }
 
@@ -767,6 +1017,20 @@ bot.on('message', async msg => {
         try { await bot.sendMessage(managerId, '✅ আপনাকে Trusted BAZAAR bot-এর Manager হিসেবে যোগ করা হয়েছে। /admin লিখে প্যানেল খুলুন।'); } catch (_) {}
         await bot.sendMessage(chatId, `✅ Manager যোগ হয়েছে: ${managerId}\nতাকে bot-এ /start দিতে বলুন, তারপর /admin ব্যবহার করতে পারবে।`, { reply_markup: adminKeyboard(uid) });
         return showManagers(chatId);
+      }
+      if (state?.type === 'support_agent_add') {
+        if (!isOwner(uid)) { clearState(uid); return bot.sendMessage(chatId, '⛔ শুধু Admin Support Agent যোগ করতে পারবেন।'); }
+        const [rawUsername, ...nameParts] = text.split('|');
+        const username = rawUsername.trim().replace(/^@/, '');
+        const displayName = nameParts.join('|').trim() || username;
+        if (!/^[A-Za-z0-9_]{5,32}$/.test(username)) return bot.sendMessage(chatId, '⚠️ বৈধ Telegram username দিন (কমপক্ষে ৫ অক্ষর)।');
+        if (db.supportAgents.some(agent => agent.username.toLowerCase() === username.toLowerCase())) {
+          clearState(uid); return bot.sendMessage(chatId, 'ℹ️ এই Support Agent আগে থেকেই যোগ করা আছে।', { reply_markup: adminKeyboard(uid) });
+        }
+        db.supportAgents.push({ username, name: displayName.slice(0, 50) });
+        await saveDb(); clearState(uid);
+        await bot.sendMessage(chatId, `✅ Support Agent যোগ হয়েছে: ${displayName} (@${username})`, { reply_markup: adminKeyboard(uid) });
+        return showSupportAgentsAdmin(chatId);
       }
       if (state?.type === 'add_service') {
         const ids = text.split(/[,\s]+/).map(x => x.trim()).filter(Boolean), added = [];
@@ -799,10 +1063,17 @@ bot.on('message', async msg => {
         const number = text.trim();
         if (!/^[0-9+\-\s]{8,25}$/.test(number)) return await bot.sendMessage(chatId, '⚠️ সঠিক payment number দিন।');
         const method = state.method;
-        db.paymentMethods[method] = number;
-        db.paymentNumbers = Object.values(db.paymentMethods).filter(Boolean);
+        if (state.paymentOwner === 'manager') {
+          if (!isManager(uid)) { clearState(uid); return bot.sendMessage(chatId, '⛔ Manager permission নেই।'); }
+          if (!db.managerPaymentMethods[String(uid)]) db.managerPaymentMethods[String(uid)] = { "বিকাশ": "", "নগদ": "", "বাইন্সাস": "" };
+          db.managerPaymentMethods[String(uid)][method] = number;
+        } else {
+          if (!isOwner(uid)) { clearState(uid); return bot.sendMessage(chatId, '⛔ Admin permission নেই।'); }
+          db.paymentMethods[method] = number;
+          db.paymentNumbers = Object.values(db.paymentMethods).filter(Boolean);
+        }
         await saveDb(); clearState(uid);
-        return await bot.sendMessage(chatId, `✅ ${method} payment number সেট হয়েছে:\n${number}`, { reply_markup: adminKeyboard(chatId) });
+        return await bot.sendMessage(chatId, `✅ ${isOwner(uid) ? 'Admin' : 'Manager'} ${method} payment number সেট হয়েছে:\n${number}`, { reply_markup: adminKeyboard(chatId) });
       }
       if (state?.type === 'payment_change') {
         const number = text.trim();
@@ -824,7 +1095,7 @@ bot.on('message', async msg => {
       }
     }
 
-    return await bot.sendMessage(chatId, `ℹ️ আমি পেয়েছি: ${text}\n\nনিচের মেনু থেকে একটি অপশন নির্বাচন করুন।`, { reply_markup: customerKeyboard(uid) });
+    return await bot.sendMessage(chatId, localized(uid, `ℹ️ আমি পেয়েছি: ${text}\n\nনিচের মেনু থেকে একটি অপশন নির্বাচন করুন।`, `ℹ️ I received: ${text}\n\nChoose an option from the menu below.`), { reply_markup: customerKeyboard(uid) });
   } catch (e) {
     console.error('Message handler error:', e.stack || e.message);
     try { await bot.sendMessage(chatId, `❌ Bot error: ${e.message || 'Unknown error'}\n\nRender Logs দেখুন।`); } catch (_) {}
